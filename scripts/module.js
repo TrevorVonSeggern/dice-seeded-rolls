@@ -115,6 +115,25 @@ Hooks.once("init", () => {
 });
 
 Hooks.once("ready", () => {
+  // Register /roll-reset as a native chat command (v14 ChatLog.CHAT_COMMANDS).
+  // Typing any unknown "/command" throws before a message is even created, so the
+  // command must be registered here (ready, when the foundry namespace exists).
+  const ChatLog = foundry.applications.sidebar.tabs.ChatLog;
+  if (ChatLog?.CHAT_COMMANDS && !ChatLog.CHAT_COMMANDS["roll-reset"]) {
+    ChatLog.CHAT_COMMANDS["roll-reset"] = {
+      rgx: /^\/roll-reset(?:\s|$)/,
+      fn: async function () {
+        if (game.user.isGM) {
+          await settingsSet(SETTINGS.daySeed, makeSeed());
+          await settingsSet(SETTINGS.rollIndex, 0);
+          console.log(`${MODULE_ID} | Day reset. New seed:`, settingsGet(SETTINGS.daySeed, 0));
+        }
+        // Return false to consume the command so nothing is posted to chat.
+        return false;
+      }
+    };
+  }
+
   // Randomize the day seed once, GM-side only, so a world starts with a real seed.
   if (game.user.isGM && !settingsGet(SETTINGS.daySeed, 0)) {
     void settingsSet(SETTINGS.daySeed, makeSeed());
@@ -134,20 +153,6 @@ Hooks.once("ready", () => {
     const _roll = DicePool.prototype.roll;
     DicePool.prototype.roll = seedTermRoll(_roll);
   }
-
-  // GM-only chat command to start a new day: fresh seed, counter reset.
-  Hooks.on("preCreateChatMessage", (message) => {
-    if (!game.user.isGM) return;
-    const content = String(message.content ?? "").trim();
-    if (content.toLowerCase() === "/roll-reset") {
-      void (async () => {
-        await settingsSet(SETTINGS.daySeed, makeSeed());
-        await settingsSet(SETTINGS.rollIndex, 0);
-        console.log(`${MODULE_ID} | Day reset. New seed:`, settingsGet(SETTINGS.daySeed, 0));
-      })();
-      return false;
-    }
-  });
 });
 
 function makeSeed() {
