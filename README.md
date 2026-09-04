@@ -18,7 +18,12 @@ which player performs them.
 - Resetting the roll counter (`rollIndex = 0`) replays the sequence from the start, so the
   first `1d20` of the new "day" always yields the same number.
 
-Control is **GM-only** (world settings are not shown to players).
+Control is **GM-only** (world settings are not shown to players). The `rollIndex` counter lives
+in a **world-scope setting that only the GM can write**, so player rolls reserve their counter
+slots through a module socket: the rolling client asks the GM (the counter authority) to advance
+the counter and ack the reserved slot. This keeps every client on the same counter with no
+settings-permission errors for players. If **no GM is online**, player rolls degrade to a local
+counter (warning in console); cross-client replay still requires a connected GM.
 
 ## GM usage
 
@@ -45,10 +50,12 @@ Control is **GM-only** (world settings are not shown to players).
 
 ## Important caveats
 
-- Foundry evaluates dice on the **rolling player's client**. Because the counter is
-  world-synced, determinism holds under **sequential, turn-based play** — the normal D&D case.
-  If two players roll in the *literal same instant*, both may read the same `rollIndex` slot
-  (a race). Keep rolls effectively sequential for exact replays.
+- Foundry evaluates dice on the **rolling player's client**. The GM (counter authority)
+  serializes counter reservations, so simultaneous rolls from different players still receive
+  distinct slots. Exact replay still assumes the *same rolls happen in the same order* each
+  "day" — the normal turn-based case.
+- If no GM is connected, player rolls use a local fallback counter and are **not** guaranteed to
+  match across clients.
 - The seeded stream is established at the **die term** boundary. Randomness requested outside a
   die term (e.g. a system calling `CONFIG.Dice.randomUniform` directly, not via `Die`/`DiePool`)
   falls back to native randomness and does not advance the counter.

@@ -21,6 +21,75 @@ function mulberry32(seed) {
   };
 }
 
+// ---- Roll counter (GM-authoritative) ------------------------------------------
+// rollIndex is a world-scope setting, which only GMs may write. Since dice are
+// evaluated on the rolling player's client, non-GM rolls must ask the GM to
+// reserve their counter slots over the socket instead of writing the setting.
+const SOCKET_EVENT = `module.${MODULE_ID}`;
+
+// Serializes reservations so concurrent terms/rolls on one client get distinct bases.
+let reservationTail = Promise.resolve();
+// Optimistic fallback counter used only when no GM can answer a reservation.
+let noGMCounter = null;
+// Shadow of rollIndex kept on the counter authority so increments (including
+// those for remote players) are serialized locally instead of racing on the
+// synced setting value.
+let gmShadow = null;
+
+function gmAdvance(count) {
+  if (gmShadow === null) gmShadow = settingsGet(SETTINGS.rollIndex, 0);
+  const base = gmShadow;
+  gmShadow += count;
+  void settingsSet(SETTINGS.rollIndex, gmShadow);
+  return base;
+}
+
+// Only one connected GM should act as the counter authority to avoid double-increments.
+function isCounterAuthority() {
+  if (!game.user.isGM) return false;
+  const actives = game.users.filter((u) => u.isGM && u.active);
+  if (actives.length < 2) return true;
+  return actives.sort((a, b) => (a.id < b.id ? -1 : 1))[0].id === game.user.id;
+}
+
+async function reserveSlots(count) {
+  const run = reservationTail.then(async () => {
+    if (isCounterAuthority()) return gmAdvance(count);
+    return requestReservation(count);
+  });
+  reservationTail = run.catch(() => {});
+  return run;
+}
+
+function requestReservation(count) {
+  return new Promise((resolve) => {
+    const id = `reserve-${game.user.id}-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+    let timer = null;
+    const finish = (base) => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      resolve(base);
+    };
+    timer = setTimeout(() => {
+      // No GM answered: degrade to a local optimistic counter so rolls still vary.
+      const base = noGMCounter === null ? settingsGet(SETTINGS.rollIndex, 0) : noGMCounter;
+      noGMCounter = base + count;
+      finish(base);
+      console.warn(
+        `${MODULE_ID} | No GM available to reserve the roll counter; using a local counter. Cross-client replay will not reproduce.`
+      );
+    }, 2000);
+    try {
+      game.socket.emit(SOCKET_EVENT, { type: "reserve", id, count }, (resp) => {
+        if (resp?.type === "reserve" && resp.id === id) finish(resp.base);
+      });
+    } catch (err) {
+      // Socket unavailable entirely: fall back to the sync (GM) path.
+      finish(settingsGet(SETTINGS.rollIndex, 0));
+    }
+  });
+}
+
 // ---- World-synced, GM-only state --------------------------------------------
 const SETTINGS = {
   enabled: "enabled",
@@ -59,16 +128,15 @@ function randomUniformOverride() {
 // PRNG from daySeed:base, run the original roll, and release the stream.
 // Internal draws (explosions, rerolls, keep/drop) share one deterministic stream,
 // so an identical term at an identical position always reproduces the same faces.
-function seedTermRoll(_termRoll, options) {
+function seedTermRoll(_termRoll) {
   return async function (rollOptions) {
     const opts = rollOptions ?? {};
     if (!settingsGet(SETTINGS.enabled, true) || opts.maximize || opts.minimize) {
       return _termRoll.call(this, opts);
     }
-    const number = this.number || 1;
-    const base = settingsGet(SETTINGS.rollIndex, 0);
-    // Reserve slots synchronously so later terms in the same roll get distinct base.
-    void settingsSet(SETTINGS.rollIndex, base + number);
+    const count = this.number || 1;
+    // Reserve counter slots before drawing so the seed is known up front.
+    const base = await reserveSlots(count);
     stream.active = true;
     stream.rng = mulberry32(hashSeed(`${settingsGet(SETTINGS.daySeed, 0)}:${base}`));
     try {
@@ -115,6 +183,19 @@ Hooks.once("init", () => {
 });
 
 Hooks.once("ready", () => {
+  // The counter authority answers reservation requests from player clients.
+  // The acknowledgment (with the reserved base slot) returns only to the requester.
+  if (game.socket && isCounterAuthority()) {
+    gmShadow = settingsGet(SETTINGS.rollIndex, 0);
+    game.socket.on(SOCKET_EVENT, (data, ack) => {
+      if (data?.type !== "reserve") return;
+      const base = gmAdvance(data.count);
+      if (typeof ack === "function") {
+        ack({ type: "reserve", id: data.id, base });
+      }
+    });
+  }
+
   // Register /roll-reset as a native chat command (v14 ChatLog.CHAT_COMMANDS).
   // Typing any unknown "/command" throws before a message is even created, so the
   // command must be registered here (ready, when the foundry namespace exists).
@@ -123,7 +204,8 @@ Hooks.once("ready", () => {
     ChatLog.CHAT_COMMANDS["roll-reset"] = {
       rgx: /^\/roll-reset(?:\s|$)/,
       fn: async function () {
-        if (game.user.isGM) {
+        if (isCounterAuthority()) {
+          gmShadow = 0;
           await settingsSet(SETTINGS.rollIndex, 0);
           console.log(`${MODULE_ID} | Roll counter reset to 0. Seed unchanged:`, settingsGet(SETTINGS.daySeed, 0));
         }
