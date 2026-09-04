@@ -1,0 +1,62 @@
+# Dice Seeded Rolls
+
+Foundry VTT module for a D&D one-shot "replay the day" loop. Every die result is
+deterministically derived from a **day seed** and a **global per-face roll counter**.
+Resetting the day makes all subsequent rolls reproduce identically, regardless of which
+player performs them.
+
+## How it works
+
+- `daySeed` and `rollIndex` are stored as **world-scope settings**, auto-synced to every
+  connected client by Foundry.
+- `CONFIG.Dice.randomUniform` — Foundry's single entropy function for all dice — is replaced
+  so every random draw is deterministic.
+- Each die term reserves a contiguous block of counter slots: when a `1d20` evaluates at
+  `rollIndex = N`, all its values come from a PRNG seeded by `hash(daySeed : N)`, then the
+  counter advances by the number of declared dice. An identical die at an identical position
+  always reproduces the same faces.
+- Resetting the day sets a fresh `daySeed` and `rollIndex = 0`, so the first `1d20` of the
+  new day always yields the same number.
+
+Control is **GM-only** (world settings are not shown to players).
+
+## GM usage
+
+- **Start / reset a day**: type `/roll-reset` in chat (GM only). This randomizes the day
+  seed and zeroes the counter. The command line is consumed and not posted to chat.
+- **Toggle detection**: in Settings → `Dice Seeded Rolls` → toggle `Enabled`. When disabled,
+  rolls fall back to Foundry's native randomness **without advancing the counter**. Re-enabling
+  resumes at the last counter value, so always `/roll-reset` to establish a clean baseline
+  before a replay.
+
+## Important caveats
+
+- Foundry evaluates dice on the **rolling player's client**. Because the counter is
+  world-synced, determinism holds under **sequential, turn-based play** — the normal D&D case.
+  If two players roll in the *literal same instant*, both may read the same `rollIndex` slot
+  (a race). Keep rolls effectively sequential for exact replays.
+- The seeded stream is established at the **die term** boundary. Randomness requested outside a
+  die term (e.g. a system calling `CONFIG.Dice.randomUniform` directly, not via `Die`/`DiePool`)
+  falls back to native randomness and does not advance the counter.
+
+## Compatibility
+
+Verified against Foundry **v14**. Minimum/maximum set to 14.
+
+## Development
+
+Plain JavaScript, no build step. Layout mirrors the reference module:
+
+```
+module.json                  # manifest: id, compatibility, esmodules, languages
+scripts/module.js            # settings, seeded PRNG, randomUniform override, die-term counter, /roll-reset
+lang/en.json                 # localization
+.github/workflows/release.yml
+```
+
+### Releasing
+
+Tag a release with `v<semver>` (e.g. `git tag v0.2.0 && git push --tags`). The GitHub
+Action rewrites `module.json` (`version`, `download`), zips the module, and attaches
+`module.zip` to the release. Install in Foundry via
+`https://github.com/TrevorVonSeggern/dice-seeded-rolls/releases/latest/download/module.json`.

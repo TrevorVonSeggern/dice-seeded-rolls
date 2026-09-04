@@ -1,0 +1,4 @@
+{
+  "title": "Dice Seeded Rolls",
+  "description": "Deterministically seeds every die roll from a day seed and a global per-face roll counter."
+}

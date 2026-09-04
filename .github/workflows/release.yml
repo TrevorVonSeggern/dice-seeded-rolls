@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update manifest version and download URL
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          node <<'EOF'
+          const fs = require("fs");
+          const tag = process.env.TAG;
+          const repo = process.env.REPO;
+          const manifest = JSON.parse(fs.readFileSync("module.json", "utf8"));
+          manifest.version = tag.replace(/^v/, "");
+          manifest.download = `https://github.com/${repo}/releases/download/${tag}/module.zip`;
+          fs.writeFileSync("module.json", JSON.stringify(manifest, null, 2) + "\n");
+          EOF
+
+      - name: Create module archive
+        run: zip -r module.zip module.json scripts lang
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: module.zip
