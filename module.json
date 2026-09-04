@@ -2,7 +2,7 @@
   "id": "dice-seeded-rolls",
   "title": "Dice Seeded Rolls",
   "description": "Deterministically seeds every die roll from a day seed and a global per-face roll counter, so replaying a day reproduces the exact same results for every player.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "compatibility": {
     "minimum": "14",
     "verified": "14.365",
