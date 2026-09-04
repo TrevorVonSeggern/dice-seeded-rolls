@@ -97,9 +97,9 @@ Hooks.once("init", () => {
 
   game.settings.register(MODULE_ID, SETTINGS.daySeed, {
     name: "Day Seed",
-    hint: "Seed value used to derive every die result. Reset to replay a day.",
+    hint: "Seed value used to derive every die result. Choose this to replay a day identically; the roll counter is reset separately with /roll-reset.",
     scope: "world",
-    config: false,
+    config: true,
     type: Number,
     default: 0
   });
@@ -124,19 +124,13 @@ Hooks.once("ready", () => {
       rgx: /^\/roll-reset(?:\s|$)/,
       fn: async function () {
         if (game.user.isGM) {
-          await settingsSet(SETTINGS.daySeed, makeSeed());
           await settingsSet(SETTINGS.rollIndex, 0);
-          console.log(`${MODULE_ID} | Day reset. New seed:`, settingsGet(SETTINGS.daySeed, 0));
+          console.log(`${MODULE_ID} | Roll counter reset to 0. Seed unchanged:`, settingsGet(SETTINGS.daySeed, 0));
         }
         // Return false to consume the command so nothing is posted to chat.
         return false;
       }
     };
-  }
-
-  // Randomize the day seed once, GM-side only, so a world starts with a real seed.
-  if (game.user.isGM && !settingsGet(SETTINGS.daySeed, 0)) {
-    void settingsSet(SETTINGS.daySeed, makeSeed());
   }
 
   // Replace the global entropy function: covers every RNG consumer in core.
@@ -154,10 +148,6 @@ Hooks.once("ready", () => {
     DicePool.prototype.roll = seedTermRoll(_roll);
   }
 });
-
-function makeSeed() {
-  return Math.floor(Math.random() * 0x7fffffff) || 1;
-}
 
 // ---- Thin introspection surface ----------------------------------------------
 globalThis.diceSeededRolls = {

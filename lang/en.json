@@ -1,4 +1,18 @@
 {
   "title": "Dice Seeded Rolls",
-  "description": "Deterministically seeds every die roll from a day seed and a global per-face roll counter."
+  "description": "Deterministically seeds every die roll from a day seed and a global per-face roll counter.",
+  "settings": {
+    "dice-seeded-rolls.enabled": {
+      "name": "Enabled",
+      "hint": "Deterministically seed dice rolls from the day seed. When disabled, native randomness is used and the roll counter does not advance."
+    },
+    "dice-seeded-rolls.daySeed": {
+      "name": "Day Seed",
+      "hint": "Seed value used to derive every die result. Choose this to replay a day identically; the roll counter is reset separately with /roll-reset."
+    },
+    "dice-seeded-rolls.rollIndex": {
+      "name": "Roll Index",
+      "hint": "Global per-die-roll counter for the current day."
+    }
+  }
 }

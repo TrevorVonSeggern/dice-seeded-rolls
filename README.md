@@ -2,8 +2,8 @@
 
 Foundry VTT module for a D&D one-shot "replay the day" loop. Every die result is
 deterministically derived from a **day seed** and a **global per-face roll counter**.
-Resetting the day makes all subsequent rolls reproduce identically, regardless of which
-player performs them.
+Resetting the roll counter makes all subsequent rolls reproduce identically, regardless of
+which player performs them.
 
 ## How it works
 
@@ -15,19 +15,20 @@ player performs them.
   `rollIndex = N`, all its values come from a PRNG seeded by `hash(daySeed : N)`, then the
   counter advances by the number of declared dice. An identical die at an identical position
   always reproduces the same faces.
-- Resetting the day sets a fresh `daySeed` and `rollIndex = 0`, so the first `1d20` of the
-  new day always yields the same number.
+- Resetting the roll counter (`rollIndex = 0`) replays the sequence from the start, so the
+  first `1d20` of the new "day" always yields the same number.
 
 Control is **GM-only** (world settings are not shown to players).
 
 ## GM usage
 
-- **Start / reset a day**: type `/roll-reset` in chat (GM only). This randomizes the day
-  seed and zeroes the counter. The command line is consumed and not posted to chat.
-- **Toggle detection**: in Settings → `Dice Seeded Rolls` → toggle `Enabled`. When disabled,
-  rolls fall back to Foundry's native randomness **without advancing the counter**. Re-enabling
-  resumes at the last counter value, so always `/roll-reset` to establish a clean baseline
-  before a replay.
+- **Pick the seed**: in Settings → `Dice Seeded Rolls` → set `Day Seed` to any number. Rolls
+  are derived from `daySeed` + the roll counter, so picking a seed makes a day reproducible.
+- **Start / reset a day**: type `/roll-reset` in chat (GM only). This **only** zeroes the roll
+  counter; the day seed is left untouched. The command line is consumed and not posted to chat.
+- **Toggle detection**: toggle `Enabled`. When disabled, rolls fall back to Foundry's native
+  randomness **without advancing the counter**. Re-enabling resumes at the last counter value,
+  so always `/roll-reset` to establish a clean baseline before a replay.
 
 ## Important caveats
 
