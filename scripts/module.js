@@ -136,6 +136,15 @@ Hooks.once("ready", () => {
   // Replace the global entropy function: covers every RNG consumer in core.
   CONFIG.Dice.randomUniform = randomUniformOverride;
 
+  // Pin the uniform -> face mapping to the module's own formula so that seeds found
+  // via diceSeededRolls.findSeed reproduce the exact same faces at the table.
+  const Die = foundry.dice.terms.Die;
+  if (Die?.prototype) {
+    Die.prototype.mapRandomFace = function (u) {
+      return faceFromUniform(this.faces, u);
+    };
+  }
+
   // Reserve slots at the term boundary so accounting is correct per declared die.
   const DiceTerm = foundry.dice.terms.DiceTerm;
   if (DiceTerm?.prototype?.roll) {
@@ -149,9 +158,47 @@ Hooks.once("ready", () => {
   }
 });
 
+// ---- Uniform -> face mapping --------------------------------------------------
+// The module pins its own mapping from a uniform in [0,1) to a die face so that the
+// seed-search helper below reproduces exactly what the module produces at runtime.
+// A fair, stable mapping: face = floor(u * faces) + 1, clamped to [1, faces].
+function faceFromUniform(faces, u) {
+  return Math.min(faces, Math.floor(u * faces) + 1);
+}
+
+// ---- Seed search ---------------------------------------------------------------
+// Facilities for finding a daySeed whose roll sequence starts with desired faces.
+// They reuse the hash/PRNG the module uses at runtime plus faceFromUniform, so a
+// found seed reproduces exact table rolls.
+
+function seedFaces(seed, faces, indices) {
+  return indices.map((i) => faceFromUniform(faces, mulberry32(hashSeed(`${seed}:${i}`))()));
+}
+
+function searchSeed(targetFaces, { faces = 20, start = 1, maxAttempts = 2000000 } = {}) {
+  const n = targetFaces.length;
+  for (let s = start; s < start + maxAttempts; s++) {
+    let ok = true;
+    for (let i = 0; i < n; i++) {
+      if (faceFromUniform(faces, mulberry32(hashSeed(`${s}:${i}`))()) !== targetFaces[i]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return s;
+  }
+  return null;
+}
+
 // ---- Thin introspection surface ----------------------------------------------
 globalThis.diceSeededRolls = {
   getDaySeed: () => settingsGet(SETTINGS.daySeed, 0),
   getRollIndex: () => settingsGet(SETTINGS.rollIndex, 0),
-  isEnabled: () => settingsGet(SETTINGS.enabled, true)
+  isEnabled: () => settingsGet(SETTINGS.enabled, true),
+  // Find a daySeed so the first targetFaces.length rolls of a faces-sided die are
+  // exactly targetFaces (e.g. diceSeededRolls.findSeed([20, 1, 20]) for 1d20s).
+  findSeed: (targetFaces, options) => searchSeed(targetFaces, options),
+  // What faces a given seed produces for the first `count` rolls.
+  previewSeed: (seed, count = 10, faces = 20) =>
+    seedFaces(seed, faces, Array.from({ length: count }, (_, i) => i))
 };

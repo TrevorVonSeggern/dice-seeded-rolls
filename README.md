@@ -1,7 +1,7 @@
 # Dice Seeded Rolls
 
 Foundry VTT module for a D&D one-shot "replay the day" loop. Every die result is
-deterministically derived from a **day seed** and a **global per-face roll counter**.
+deterministically derived from a **day seed** and a **global per-die-roll counter**.
 Resetting the roll counter makes all subsequent rolls reproduce identically, regardless of
 which player performs them.
 
@@ -24,6 +24,19 @@ Control is **GM-only** (world settings are not shown to players).
 
 - **Pick the seed**: in Settings → `Dice Seeded Rolls` → set `Day Seed` to any number. Rolls
   are derived from `daySeed` + the roll counter, so picking a seed makes a day reproducible.
+- **Find a seed for desired opening rolls**: open the browser console and use the module's
+  helper to search for a seed whose first rolls match what you want, e.g.
+  so the new day opens with a `1d20` of 20, then 1, then 20:
+
+  ```js
+  diceSeededRolls.findSeed([20, 1, 20]);
+  // -> 7704  (set this as the Day Seed)
+  diceSeededRolls.previewSeed(7704, 6);  // -> [20, 1, 20, 19, 10, 13]
+  ```
+
+  `findSeed(targetFaces, {faces, start, maxAttempts})` searches for a seed producing
+  `targetFaces` as the first rolls of a `faces`-sided die (default `d20`). Then set the
+  returned number as the Day Seed and `/roll-reset` the counter.
 - **Start / reset a day**: type `/roll-reset` in chat (GM only). This **only** zeroes the roll
   counter; the day seed is left untouched. The command line is consumed and not posted to chat.
 - **Toggle detection**: toggle `Enabled`. When disabled, rolls fall back to Foundry's native
