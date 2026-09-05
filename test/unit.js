@@ -39,14 +39,21 @@ function makeSandbox({ world, isGM }) {
       this.faces = faces;
       this.results = [];
     }
-    async roll() {
-      // Foundry's real DiceTerm#roll pulls a uniform per die from
-      // CONFIG.Dice.randomUniform (replaced by the module's seeded override in ready).
+    // Foundry v12+ semantics: _evaluate loops once per die and roll() returns a
+    // single DiceTermResult, pulling one uniform from CONFIG.Dice.randomUniform
+    // (replaced by the module's seeded override in ready) per draw.
+    async _evaluate(options) {
+      this.results = [];
       for (let done = 0; done < this.number; done++) {
-        const u = sandbox.CONFIG.Dice.randomUniform();
-        this.results.push({ result: Math.min(this.faces, Math.floor(u * this.faces) + 1), active: true });
+        await this.roll(options);
       }
       return this;
+    }
+    async roll() {
+      const u = sandbox.CONFIG.Dice.randomUniform();
+      const roll = { result: Math.min(this.faces, Math.floor(u * this.faces) + 1), active: true };
+      this.results.push(roll);
+      return roll;
     }
     get total() {
       return this.results.reduce((s, r) => s + r.result, 0);
@@ -126,7 +133,7 @@ function makeSandbox({ world, isGM }) {
   // the module's ready hook wraps it into the seeded evaluator.
   const RollEvaluate = async function (options) {
     for (const t of this.terms) {
-      if (t instanceof FakeDiceTerm) await t.roll(options);
+      if (t instanceof FakeDiceTerm) await t._evaluate(options);
       else if (t?.roll && Array.isArray(t.roll.terms)) await t.roll.evaluate?.(options);
     }
     return this;
@@ -317,7 +324,7 @@ test("stale old-shape reply degrades to the local chain", async () => {
   assert.strictEqual(world.stored[KEYS.rollIndex], 9, "GM counter untouched by override");
 });
 
-test("end-to-end: 2d20 evaluation reproduces nextRandom-derived faces", async () => {
+test("end-to-end: 2d20 evaluation reproduces the exact seeded faces", async () => {
   const world = newWorld();
   makeSandbox({ world, isGM: true });
   const ctx = makeSandbox({ world, isGM: false });
@@ -333,9 +340,13 @@ test("end-to-end: 2d20 evaluation reproduces nextRandom-derived faces", async ()
   };
   await roll.evaluate();
 
-  const faces = roll.terms[0].results.map((r) => r.result);
-  const expected = [0, 1].map((i) => ctx.faceFromUniform(20, ctx.nextRandom(world.defaults.daySeed, i)));
-  assert.deepStrictEqual(faces, expected, "die faces match the seeded uniforms");
+  // Seed 7704: uniforms at offsets 0 and 1 map to faces 20 and 1. The second die
+  // must NOT reuse the first die's uniform (the reason a 2d20 rolled 20,20).
+  assert.deepStrictEqual(
+    roll.terms[0].results.map((r) => r.result),
+    [20, 1],
+    "each die consumes its own offset"
+  );
   assert.strictEqual(world.stored[KEYS.rollIndex], 2, "counter advanced by declared dice");
 
   // Second roll occupies fresh slots -> reproduces its own deterministic faces.
@@ -348,9 +359,48 @@ test("end-to-end: 2d20 evaluation reproduces nextRandom-derived faces", async ()
     },
   };
   await roll2.evaluate();
-  const faces2 = roll2.terms[0].results.map((r) => r.result);
-  const expected2 = [0, 1].map((i) => ctx.faceFromUniform(20, ctx.nextRandom(world.defaults.daySeed, 2 + i)));
-  assert.deepStrictEqual(faces2, expected2, "subsequent roll uses advanced slots");
+  assert.deepStrictEqual(
+    roll2.terms[0].results.map((r) => r.result),
+    [20, 19],
+    "subsequent roll uses advanced slots"
+  );
+});
+
+test("v12 per-die roll calls pop one uniform each from the reservation", async () => {
+  const world = newWorld();
+  makeSandbox({ world, isGM: true }); // authority reserves [u0, u1]
+  const ctx = makeSandbox({ world, isGM: false });
+  world.stored[KEYS.rollIndex] = 0;
+
+  const { Die } = ctx.foundry.dice.terms;
+  const die = new Die(2, 20);
+  await die._evaluate();
+
+  const uniforms = ctx.nextRandom;
+  assert.deepStrictEqual(
+    die.results.map((r) => r.result),
+    [20, 1],
+    "two roll() calls produce two distinct seeded faces"
+  );
+  assert.strictEqual(die.results[1].result, ctx.faceFromUniform(20, uniforms(world.defaults.daySeed, 1)));
+  assert.strictEqual(world.stored[KEYS.rollIndex], 2, "standalone term advances the counter");
+});
+
+test("standalone Die evaluation outside any Roll gets its own seeded block", async () => {
+  const world = newWorld();
+  makeSandbox({ world, isGM: true }); // authority, no socket round trip needed
+  const ctx = makeSandbox({ world, isGM: true });
+  world.stored[KEYS.rollIndex] = 0;
+
+  const { Die } = ctx.foundry.dice.terms;
+  const die = new Die(2, 20);
+  await die._evaluate();
+  assert.deepStrictEqual(
+    die.results.map((r) => r.result),
+    [20, 1],
+    "standalone term is seeded like any other"
+  );
+  assert.strictEqual(world.stored[KEYS.rollIndex], 2);
 });
 
 // ---- runner ---------------------------------------------------------------

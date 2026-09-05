@@ -253,13 +253,11 @@ Hooks.once("ready", () => {
 
 
 
-// Roll-scoped cursor: the chunk of uniform values this Roll reserved in one batch.
-// Die terms slice their uniforms off this cursor instead of doing their own round trip.
+// Roll-scoped cursor: the chunk of uniform values reserved for the current
+// evaluation. Draws pop one uniform per CONFIG.Dice.randomUniform() call, no
+// matter where core draws them (v12+ calls DiceTerm#roll once per die; earlier
+// versions loop internally inside a single Term#roll).
 const rollCursor = { active: false, rolls: [], used: 0, total: 0 };
-
-// Stream currently feeding the interleaved RNG consumer during a die term's own
-// evaluation. randomUniformOverride pops values off it one die at a time.
-const stream = { active: false, rolls: [], idx: 0 };
 
 // Serialize whole Roll evaluations so concurrent async Rolls on one client never
 // interleave their cursor reads/writes.
@@ -271,11 +269,11 @@ function withEvaluation(fn) {
 }
 
 // Every random draw in the dice system funnels through here (via
-// CONFIG.Dice.randomUniform); a die term under an active stream consumes its
-// pre-computed uniforms, otherwise native randomness is used.
+// CONFIG.Dice.randomUniform); an active cursor consumes its pre-computed
+// uniforms in draw order, otherwise native randomness is used.
 function randomUniformOverride() {
-	if (stream.active && stream.idx < stream.rolls.length)
-		return stream.rolls[stream.idx++];
+	if (rollCursor.active && rollCursor.used < rollCursor.rolls.length)
+		return rollCursor.rolls[rollCursor.used++];
 	return Math.random();
 }
 
@@ -309,49 +307,33 @@ function seedRollEvaluate(protoRollEvaluate) {
 	};
 }
 
-// Carve the term's uniforms out of the enclosing Roll's batched reservation (or, for
-// a standalone term outside any Roll, fetch its own block), make them the active
-// stream, run the original roll, and release the stream. Internal draws (explosions,
-// rerolls, keep/drop, pool sub-dice) share one stream — the active-stream guard
-// prevents them from re-reserving or clobbering it.
-function seedTermRoll(prototype) {
-	return async function (rollOptions) {
-		const opts = rollOptions ?? {};
+// Standalone term evaluation (a Die or Pool rolled outside any seeded Roll):
+// reserve the term's own block into the cursor and let its draws pop from it.
+// Inside a seeded Roll the term simply draws from the Roll's reservation, so the
+// cursor is left untouched and nested re-evaluations pass through.
+function seedTermEvaluate(prototype) {
+	return async function (options) {
+		const opts = options ?? {};
 		if (!settingsGet(SETTINGS.enabled, true) || opts.maximize || opts.minimize)
 			return prototype.call(this, opts);
-
-		// Nested evaluation (explosion, reroll, pool sub-die): reuse the active stream.
-		if (stream.active)
+		if (rollCursor.active)
 			return prototype.call(this, opts);
 
 		const number = this.number || 1;
-		let rolls;
-		if (rollCursor.active) {
-			if (rollCursor.used + number > rollCursor.total) {
-				// Estimation mismatch safety valve: never reuse a slot, supplement instead.
-				console.warn(`${MODULE_ID} | Roll had more dice than estimated; reserving supplementary slots.`);
-				rolls = await requestRollsFromServerAsync(number);
-			} else {
-				rolls = rollCursor.rolls.slice(rollCursor.used, rollCursor.used + number);
-				rollCursor.used += number;
-			}
-		} else {
-			rolls = await requestRollsFromServerAsync(number);
-		}
-		stream.active = true;
-		stream.rolls = rolls;
-		stream.idx = 0;
+		rollCursor.active = true;
+		rollCursor.rolls = await requestRollsFromServerAsync(number);
+		rollCursor.used = 0;
+		rollCursor.total = number;
 		try {
 			return await prototype.call(this, opts);
 		} finally {
-			stream.active = false;
-			stream.rolls = [];
-			stream.idx = 0;
+			rollCursor.active = false;
+			rollCursor.rolls = [];
+			rollCursor.used = 0;
+			rollCursor.total = 0;
 		}
 	};
 }
-
-
 
 Hooks.once("ready", () => {
   // Batch a Roll's declared dice into a single reservation. Roll#evaluate funnels
@@ -369,7 +351,10 @@ Hooks.once("ready", () => {
     }
   }
 
-  // Replace the global entropy function: covers every RNG consumer in core.
+  // Replace the global entropy function: covers every RNG consumer in core. It
+  // pops the reserved uniforms in draw order, so 2d20 consumes two distinct
+  // uniforms regardless of whether core rolls per die (v12+) or in a term loop
+  // (v10/11).
   CONFIG.Dice.randomUniform = randomUniformOverride;
 
   // Pin the uniform -> face mapping to the module's own formula so that seeds found
@@ -381,17 +366,15 @@ Hooks.once("ready", () => {
     };
   }
 
-  // Reserve slots at the term boundary so accounting is correct per declared die.
-  const DiceTerm = foundry.dice.terms.DiceTerm;
-  if (DiceTerm?.prototype?.roll) {
-    const _roll = DiceTerm.prototype.roll;
-    DiceTerm.prototype.roll = seedTermRoll(_roll);
-  }
-  const DicePool = foundry.dice.terms.DicePool;
-  if (DicePool?.prototype?.roll) {
-    const _roll = DicePool.prototype.roll;
-    DicePool.prototype.roll = seedTermRoll(_roll);
-  }
+  // Reserve slots at the term boundary so standalone term evaluations (a Die or
+  // Pool evaluated outside a Roll, e.g. new Die(2, 20).evaluate()) get their own
+  // seeded block while the global cursor stays consistent.
+  const wrapTermEvaluate = (proto) => {
+    const name = proto && (proto._evaluate ? "_evaluate" : proto.evaluate ? "evaluate" : null);
+    if (name) proto[name] = seedTermEvaluate(proto[name]);
+  };
+  wrapTermEvaluate(foundry.dice.terms.DiceTerm?.prototype);
+  wrapTermEvaluate(foundry.dice.terms.DicePool?.prototype);
 });
 
 // ---- Uniform -> face mapping --------------------------------------------------
