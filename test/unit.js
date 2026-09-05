@@ -25,7 +25,7 @@ function newWorld() {
     defaults: { enabled: true, daySeed: 7704, rollIndex: 0 },
     stored: {},
     gmActive: true,
-    reserveHandlers: null,
+    clients: [],
     emits: [],
   };
 }
@@ -55,9 +55,13 @@ function makeSandbox({ world, isGM }) {
   class FakeDie extends FakeDiceTerm {}
   class FakeDicePool extends FakeDiceTerm {}
 
+  const handlers = [];
+  const userId = isGM ? "gm-a" : "player-1";
+  world.clients.push({ id: userId, handlers });
+
   const sandbox = {
     game: {
-      user: { id: isGM ? "gm-a" : "player-1", isGM },
+      user: { id: userId, isGM },
       users: {
         filter: (fn) =>
           (gmActive ? [{ id: "gm-a", isGM: true, active: true }] : []).filter(fn),
@@ -82,16 +86,23 @@ function makeSandbox({ world, isGM }) {
       },
       socket: {
         on: (_ev, fn) => {
-          if (isGM) (world.reserveHandlers ??= []).push(fn);
+          handlers.push(fn);
         },
         emit: (_ev, data, cb) => {
           world.emits.push(data);
-          if (Object.hasOwn(world, "overrideAck")) {
-            cb?.(world.overrideAck);
-          } else if (world.reserveHandlers) {
-            for (const h of world.reserveHandlers) h(data, (resp) => cb?.(resp));
-          } else {
-            cb?.(null);
+          // The server relays the data to every other client; the emit callback is a
+          // server receipt echo and does not carry replies from other clients.
+          if (typeof cb === "function") cb?.(data);
+          if (world.relayEnabled === false) return;
+          for (const client of world.clients) {
+            if (client.id === userId) continue;
+            let payload = data;
+            if (data?.type === "reserve" && world.reserveOverride) {
+              const override = world.reserveOverride(data);
+              if (override === undefined) continue; // reply dropped
+              payload = override;
+            }
+            for (const h of client.handlers) h(payload);
           }
         },
       },
@@ -107,8 +118,8 @@ function makeSandbox({ world, isGM }) {
     Math,
     Date,
     console: { log: () => {}, warn: () => {}, error: () => {} },
-    setTimeout,
-    clearTimeout,
+    setTimeout: (fn, ms) => (world.fakeClock ? world.fakeClock.set(fn) : globalThis.setTimeout(fn, ms)),
+    clearTimeout: (id) => (world.fakeClock ? world.fakeClock.clear(id) : globalThis.clearTimeout(id)),
   };
   sandbox.CONFIG.Dice.randomUniform = () => Math.min(0.999999, Math.random());
   // Foundry's Roll.prototype.evaluate chains term evaluations; attach a fake here so
@@ -251,7 +262,10 @@ test("GM authority: reservation returns nextRandom uniforms and advances the cou
 test("player reservation through the GM returns the GM-computed uniforms", async () => {
   const world = newWorld();
   makeSandbox({ world, isGM: true }); // registers the reserve handler
-  assert.ok(world.reserveHandlers, "GM registered a reserve handler");
+  assert.ok(
+    world.clients.some((c) => c.id === "gm-a" && c.handlers.length > 0),
+    "GM registered a reserve handler"
+  );
 
   const ctx = makeSandbox({ world, isGM: false });
   const rolls = await ctx.requestRollsFromServerAsync(2);
@@ -273,14 +287,17 @@ test("no-GM degraded path chains a local offset from the world counter", async (
   assert.strictEqual(world.stored[KEYS.rollIndex], 4, "world counter untouched when no GM");
 });
 
-test("absent reservation reply (null ack) degrades to the local chain", async () => {
+test("absent reservation reply degrades to the local chain after the timeout", async () => {
   const world = newWorld();
-  makeSandbox({ world, isGM: true }); // GM exists but never acks
+  makeSandbox({ world, isGM: true }); // GM online but its replies never arrive
   world.stored[KEYS.rollIndex] = 4;
-  world.overrideAck = null;
+  world.relayEnabled = false;
+  world.fakeClock = { set: (fn) => (world.deferred = fn), clear: () => {} };
   const ctx = makeSandbox({ world, isGM: false });
 
-  const rolls = await ctx.requestRollsFromServerAsync(2);
+  const pendingRolls = ctx.requestRollsFromServerAsync(2);
+  world.deferred(); // reservation times out, no GM reply received
+  const rolls = await pendingRolls;
   const expected = [0, 1].map((i) => ctx.nextRandom(world.defaults.daySeed, 4 + i));
   assertNumbersEqual(rolls, expected, "degraded chain starts at synced rollIndex");
   assert.strictEqual(world.stored[KEYS.rollIndex], 4, "GM world counter untouched");
@@ -291,12 +308,13 @@ test("stale old-shape reply degrades to the local chain", async () => {
   makeSandbox({ world, isGM: true });
   world.stored[KEYS.rollIndex] = 9;
   // Old 0.0.8-style grant reply: base/count, no rolls array.
-  world.overrideAck = { id: "x", type: "reserve-respond", base: 9, count: 2 };
+  world.reserveOverride = (req) => ({ id: req.id, type: "reserve-respond", base: 9, count: 2 });
   const ctx = makeSandbox({ world, isGM: false });
 
   const rolls = await ctx.requestRollsFromServerAsync(2);
   const expected = [0, 1].map((i) => ctx.nextRandom(world.defaults.daySeed, 9 + i));
   assertNumbersEqual(rolls, expected, "rejects wrong shape, uses degraded chain");
+  assert.strictEqual(world.stored[KEYS.rollIndex], 9, "GM counter untouched by override");
 });
 
 test("end-to-end: 2d20 evaluation reproduces nextRandom-derived faces", async () => {

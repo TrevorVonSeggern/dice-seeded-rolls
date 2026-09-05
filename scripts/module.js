@@ -13,6 +13,12 @@ let currentOffset = null;
 let gmWasActive = false; // players are local to start pre-gm
 let degradedOffset = null; // local chain position when no GM reply is available
 
+// Socket round-trip bookkeeping. Foundry relays module events to all other clients
+// but does not forward emit-ack callbacks, so reservations use a request/response
+// message pair matched by id (the socketlib pattern).
+const RESERVE_TIMEOUT_MS = 3000;
+const pendingRequests = new Map(); // id -> { finish, count, timer }
+
 function settingsGet(key, fallback) {
 	try {
 		return game.settings.get(MODULE_ID, key);
@@ -148,7 +154,7 @@ Hooks.once("ready", () => {
 	gmWasActive = hasActiveGM();
 
 	// Counter Authority handle count and broadcast result.
-	game.socket.on(SOCKET_EVENT, (data, response) => {
+	game.socket.on(SOCKET_EVENT, data => {
 		if (!data || data?.type !== "reserve" || !isCounterAuthority())
 			return;
 		const requestedCount = Math.floor(Number(data.count ?? 0)) || 1;
@@ -159,8 +165,8 @@ Hooks.once("ready", () => {
 			type: "reserve-respond",
 			rolls: Array.from({length: requestedCount}).map((_, i) => nextRandom(seed, prevCount + i))
 		};
-		if (typeof response === "function")
-			response(responseBody);
+		// response
+		game.socket.emit(SOCKET_EVENT, responseBody);
 		gmAdvance(requestedCount);
 		gmBroadcast();
 	});
@@ -171,6 +177,21 @@ Hooks.once("ready", () => {
 		currentOffset = data.rollIndex;
 		currentSeed = data.seed;
 		degradedOffset = null;
+	});
+
+	// Waiting players resolve their reservation from the authority's reply.
+	game.socket.on(SOCKET_EVENT, data => {
+		if (!data || data?.type !== "reserve-respond" || isCounterAuthority())
+			return;
+		const entry = pendingRequests.get(data.id);
+		if (!entry)
+			return;
+		pendingRequests.delete(data.id);
+		clearTimeout(entry.timer);
+		if (Array.isArray(data.rolls))
+			entry.finish(data.rolls);
+		else
+			entry.finish(chainLocalRolls(entry.count));
 	});
 });
 
@@ -193,19 +214,22 @@ function requestRollsFromServerAsync(count) {
 	if(!hasActiveGM())
 		return Promise.resolve(chainLocalRolls(count));
 	return new Promise(finish => {
-		var reserveRequestBody = {
+		const id = generateRequestId();
+		const reserveRequestBody = {
 			type: "reserve",
-			id: generateRequestId(),
+			id,
 			from: game.user.id,
 			count
 		};
-		game.socket.emit(SOCKET_EVENT, reserveRequestBody, (resp) => {
-			if (resp && Array.isArray(resp.rolls)) {
-				finish(resp.rolls);
-			} else {
-				finish(chainLocalRolls(count));
-			}
+		pendingRequests.set(id, {
+			finish,
+			count,
+			timer: setTimeout(() => {
+				if (pendingRequests.delete(id))
+					finish(chainLocalRolls(count));
+			}, RESERVE_TIMEOUT_MS)
 		});
+		game.socket.emit(SOCKET_EVENT, reserveRequestBody);
 	});
 }
 
