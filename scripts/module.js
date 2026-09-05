@@ -126,7 +126,7 @@ function gmBroadcast() {
 		seed: settingsGet(SETTINGS.daySeed),
 		type: "broadcast"
 	};
-	game.socket.broadcast.emit(SOCKET_EVENT, broadcastBody)
+	game.socket.emit(SOCKET_EVENT, broadcastBody);
 }
 
 // check for changes to GM role
