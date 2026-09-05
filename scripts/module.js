@@ -31,10 +31,16 @@ const SOCKET_EVENT = `module.${MODULE_ID}`;
 let reservationTail = Promise.resolve();
 // Optimistic fallback counter used only when no GM can answer a reservation.
 let noGMCounter = null;
+// Last GM-authoritative grant this client received (its frontier). Kept so the
+// degraded local counter never re-treads slots a GM already assigned.
+let lastGrant = null;
 // Shadow of rollIndex kept on the counter authority so increments (including
 // those for remote players) are serialized locally instead of racing on the
 // synced setting value.
 let gmShadow = null;
+// Whether an active GM was observed. Players drop their degraded local counter
+// the moment a GM appears so a later fallback re-reads the authoritative value.
+let gmWasActive = false;
 
 function gmAdvance(count) {
   if (gmShadow === null) gmShadow = settingsGet(SETTINGS.rollIndex, 0);
@@ -52,6 +58,31 @@ function isCounterAuthority() {
   return actives.sort((a, b) => (a.id < b.id ? -1 : 1))[0].id === game.user.id;
 }
 
+function hasActiveGM() {
+  return game.users.some((u) => u.isGM && u.active);
+}
+
+// Grants are idempotent per request id. A retried emit (slow ack, socket repeat)
+// re-delivers the SAME id, so the GM re-acks the same base instead of consuming
+// fresh slots twice — otherwise one logical player reservation silently inflates
+// the counter and shifts every later roll (the "second roll breaks" symptom).
+const granted = new Map(); // requestId -> { base, ts }
+const GRANT_TTL = 15000;
+
+function grantOnce(requestId, count) {
+  const prior = granted.get(requestId);
+  if (prior) return prior.base;
+  const base = gmAdvance(count);
+  granted.set(requestId, { base, ts: Date.now() });
+  if (granted.size > 128) {
+    const now = Date.now();
+    for (const [id, g] of granted) {
+      if (now - g.ts > GRANT_TTL) granted.delete(id);
+    }
+  }
+  return base;
+}
+
 async function reserveSlots(count) {
   const run = reservationTail.then(async () => {
     if (isCounterAuthority()) return gmAdvance(count);
@@ -61,11 +92,45 @@ async function reserveSlots(count) {
   return run;
 }
 
+// Track a GM-authoritative grant so the local/degraded counter and the live
+// setting stay aligned with the frontier the GM actually handed out.
+function trackGrant(base, count) {
+  lastGrant = { base, count };
+  noGMCounter = Math.max(noGMCounter ?? base, base + count);
+}
+
+// Degraded counter used only when no GM can be reached. It starts at (and never
+// goes below) the latest synced rollIndex plus anything a GM already granted this
+// client, so it cannot re-tread assigned slots.
+function localFallbackBase(count) {
+  const synced = settingsGet(SETTINGS.rollIndex, 0);
+  const frontier = Math.max(
+    noGMCounter ?? 0,
+    lastGrant ? lastGrant.base + lastGrant.count : 0,
+    synced
+  );
+  noGMCounter = frontier + count;
+  return frontier;
+}
+
+// The ack can arrive wrapped by transport semantics (e.g. keyed by the answering
+// user's id). Dig the grant object for our exact request id out of any envelope.
+function findGrant(resp, id, depth = 0) {
+  if (resp == null || depth > 4 || typeof resp !== "object") return null;
+  if (resp.type === "reserve" && resp.id === id && typeof resp.base === "number") return resp;
+  for (const value of Object.values(resp)) {
+    const grant = findGrant(value, id, depth + 1);
+    if (grant) return grant;
+  }
+  return null;
+}
+
 // A single handshake for a whole Roll: reserve the exact total of declared dice
 // in one request, then each die term derives its base from a shared cursor below.
-// Bounded retry (never a silent wait): if no GM answers within the window, fall
-// back to the degraded local counter exactly as before.
-const RESERVE_DELAY = 800;
+// Bounded retry — but never a double-spend: retries reuse the request id, so the
+// GM re-acks the same base. If no GM is connected at all, degrade immediately
+// instead of waiting out the retry window.
+const RESERVE_DELAY = 1000;
 const RESERVE_RETRIES = 2;
 
 function requestReservation(count) {
@@ -73,10 +138,20 @@ function requestReservation(count) {
     const id = `reserve-${game.user.id}-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
     let attempt = 0;
     let timer = null;
+    let finished = false;
     const finish = (base) => {
+      if (finished) return;
+      finished = true;
       if (timer) clearTimeout(timer);
       timer = null;
       resolve(base);
+    };
+    const fallback = () => {
+      if (finished) return;
+      finish(localFallbackBase(count));
+      console.warn(
+        `${MODULE_ID} | No GM available to reserve the roll counter; using a local counter. Cross-client replay will not reproduce.`
+      );
     };
     const tryEmit = () => {
       attempt++;
@@ -85,23 +160,25 @@ function requestReservation(count) {
           tryEmit();
           return;
         }
-        // No GM answered: degrade to a local optimistic counter so rolls still vary.
-        const base = noGMCounter === null ? settingsGet(SETTINGS.rollIndex, 0) : noGMCounter;
-        noGMCounter = base + count;
-        finish(base);
-        console.warn(
-          `${MODULE_ID} | No GM available to reserve the roll counter; using a local counter. Cross-client replay will not reproduce.`
-        );
+        fallback();
       }, RESERVE_DELAY);
       try {
-        game.socket.emit(SOCKET_EVENT, { type: "reserve", id, count }, (resp) => {
-          if (resp?.type === "reserve" && resp.id === id) finish(resp.base);
+        game.socket.emit(SOCKET_EVENT, { type: "reserve", id, count, from: game.user.id }, (resp) => {
+          const grant = findGrant(resp, id);
+          if (grant) {
+            trackGrant(grant.base, count);
+            finish(grant.base);
+          }
         });
       } catch (err) {
-        // Socket unavailable entirely: fall back to the sync (GM) path.
-        finish(settingsGet(SETTINGS.rollIndex, 0));
+        // Socket unavailable entirely: fall back to the degraded counter.
+        fallback();
       }
     };
+    if (!hasActiveGM()) {
+      fallback();
+      return;
+    }
     tryEmit();
   });
 }
@@ -276,11 +353,20 @@ Hooks.once("ready", () => {
   // promoted later starts answering automatically (isCounterAuthority() re-evaluates
   // live against active GMs). The acknowledgment returns only to the requester.
   if (game.socket) {
+    gmWasActive = hasActiveGM();
     game.socket.on(SOCKET_EVENT, (data, ack) => {
-      if (data?.type !== "reserve" || !isCounterAuthority()) return;
-      const base = gmAdvance(data.count);
-      if (typeof ack === "function") {
-        ack({ type: "reserve", id: data.id, base });
+      if (data?.type !== "reserve") return;
+      const respond = (payload) => {
+        if (typeof ack === "function") ack(payload);
+      };
+      try {
+        if (isCounterAuthority()) {
+          const count = Math.max(1, Math.floor(Number(data.count) || 1));
+          respond({ type: "reserve", id: data.id, base: grantOnce(String(data.id), count) });
+        }
+      } catch (err) {
+        console.error(`${MODULE_ID} | Error handling a roll counter reservation.`, err);
+        respond({ type: "reserve", id: data.id, error: true });
       }
     });
   } else {
@@ -292,8 +378,12 @@ Hooks.once("ready", () => {
   // When this client becomes/assumes the counter authority (a GM logs in or out),
   // re-sync the shadow from the persisted setting before fielding reservations.
   Hooks.on("updateUser", (user, data) => {
-    if (typeof data.active === "undefined" || !game.user.isGM) return;
-    if (isCounterAuthority()) {
+    if (typeof data.active === "undefined") return;
+    // A GM appearing lets every client give up its degraded local counter so a
+    // later fallback re-reads the authoritative setting instead of local drift.
+    if (hasActiveGM() && !gmWasActive) noGMCounter = null;
+    gmWasActive = hasActiveGM();
+    if (game.user.isGM && isCounterAuthority()) {
       gmShadow = settingsGet(SETTINGS.rollIndex, 0);
       console.log(`${MODULE_ID} | Now the roll counter authority. Counter at`, gmShadow);
     }

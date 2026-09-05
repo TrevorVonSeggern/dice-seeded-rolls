@@ -29,12 +29,15 @@ hand-correct the counter; always `/roll-reset` after a manual edit.
 
 **Reliability:** the socket handler is registered on every client and the counter authority is
 elected per-request (lowest-id active GM), so a GM who connects or is promoted later starts
-answering immediately. If no GM answers within ~1.6s (2 retries), rolls fall back to a local
-per-client counter with a console warning — dice still work, but cross-client replay is not
-guaranteed and a console warning notes that the world runs with the degraded counter. Check the
-GM/player console at startup for a `dice-seeded-rolls` line confirming the socket namespace is
-live; if it reports sockets unavailable, ensure the manifest has `"socket": true` and reload the
-world (an stale module build with no socket namespace makes every reservation fall back).
+answering immediately. Retries reuse the request id, so the GM re-acks the *same* reserved base —
+a slow or repeated answer can never consume counter slots twice. If no GM is connected at all,
+player rolls fall back to a local counter instantly (no wait). If a GM is connected but cannot be
+reached, rolls fall back after ~2s (2 retries) with a console warning — dice still work, but
+cross-client replay is not guaranteed. The local fallback counter is anchored to the last synced
+`rollIndex` and to any slot a GM already granted this client, so it never re-treads used bases.
+Check the GM/player console at startup for a `dice-seeded-rolls` line confirming the socket
+namespace is live; if it reports sockets unavailable, ensure the manifest has `"socket": true` and
+reload the world (an stale module build with no socket namespace makes every reservation fall back).
 
 ## GM usage
 
