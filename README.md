@@ -11,19 +11,30 @@ which player performs them.
   connected client by Foundry.
 - `CONFIG.Dice.randomUniform` — Foundry's single entropy function for all dice — is replaced
   so every random draw is deterministic.
-- Each die term reserves a contiguous block of counter slots: when a `1d20` evaluates at
-  `rollIndex = N`, all its values come from a PRNG seeded by `hash(daySeed : N)`, then the
-  counter advances by the number of declared dice. An identical die at an identical position
-  always reproduces the same faces.
+- Each **`Roll`** reserves its declared dice in a **single batched slot reservation**: a
+  `20d20` is one counter reservation, not twenty. When a `Roll` evaluates at `rollIndex = N`,
+  every die in it derives from a PRNG seeded by `hash(daySeed : N + offset)` (offsets fixed by
+  term position), then the counter advances by the total number of declared dice. An identical
+  roll at an identical position always reproduces the same faces.
 - Resetting the roll counter (`rollIndex = 0`) replays the sequence from the start, so the
   first `1d20` of the new "day" always yields the same number.
 
 Control is **GM-only** (world settings are not shown to players). The `rollIndex` counter lives
-in a **world-scope setting that only the GM can write**, so player rolls reserve their counter
-slots through a module socket: the rolling client asks the GM (the counter authority) to advance
-the counter and ack the reserved slot. This keeps every client on the same counter with no
-settings-permission errors for players. If **no GM is online**, player rolls degrade to a local
-counter (warning in console); cross-client replay still requires a connected GM.
+in a **world-scope setting that only the GM can write** — players reserve their slots through a
+module socket instead of writing the setting directly, which keeps every client on the same
+counter with no settings-permission errors. A player's `Roll` sends **one** reservation request
+per roll; the GM (the counter authority) acks the reserved base slot and the roll evaluates
+immediately. `rollIndex` is also visible in the module settings so a GM can inspect or
+hand-correct the counter; always `/roll-reset` after a manual edit.
+
+**Reliability:** the socket handler is registered on every client and the counter authority is
+elected per-request (lowest-id active GM), so a GM who connects or is promoted later starts
+answering immediately. If no GM answers within ~1.6s (2 retries), rolls fall back to a local
+per-client counter with a console warning — dice still work, but cross-client replay is not
+guaranteed and a console warning notes that the world runs with the degraded counter. Check the
+GM/player console at startup for a `dice-seeded-rolls` line confirming the socket namespace is
+live; if it reports sockets unavailable, ensure the manifest has `"socket": true` and reload the
+world (an stale module build with no socket namespace makes every reservation fall back).
 
 ## GM usage
 
@@ -56,9 +67,12 @@ counter (warning in console); cross-client replay still requires a connected GM.
   "day" — the normal turn-based case.
 - If no GM is connected, player rolls use a local fallback counter and are **not** guaranteed to
   match across clients.
-- The seeded stream is established at the **die term** boundary. Randomness requested outside a
-  die term (e.g. a system calling `CONFIG.Dice.randomUniform` directly, not via `Die`/`DiePool`)
-  falls back to native randomness and does not advance the counter.
+- The seeded stream is established at the **`Roll` boundary** (per die term when a term is rolled
+  standalone). Randomness requested outside a roll (e.g. a system calling
+  `CONFIG.Dice.randomUniform` directly, not via `Roll`/`Die`/`DiePool`) falls back to native
+  randomness and does not advance the counter. Each batch reservation is exactly the declared
+  dice count — no block prefetching — so counter slot assignment depends only on roll order,
+  never on network timing.
 
 ## Compatibility
 

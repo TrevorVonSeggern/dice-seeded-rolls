@@ -61,32 +61,48 @@ async function reserveSlots(count) {
   return run;
 }
 
+// A single handshake for a whole Roll: reserve the exact total of declared dice
+// in one request, then each die term derives its base from a shared cursor below.
+// Bounded retry (never a silent wait): if no GM answers within the window, fall
+// back to the degraded local counter exactly as before.
+const RESERVE_DELAY = 800;
+const RESERVE_RETRIES = 2;
+
 function requestReservation(count) {
   return new Promise((resolve) => {
     const id = `reserve-${game.user.id}-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+    let attempt = 0;
     let timer = null;
     const finish = (base) => {
       if (timer) clearTimeout(timer);
       timer = null;
       resolve(base);
     };
-    timer = setTimeout(() => {
-      // No GM answered: degrade to a local optimistic counter so rolls still vary.
-      const base = noGMCounter === null ? settingsGet(SETTINGS.rollIndex, 0) : noGMCounter;
-      noGMCounter = base + count;
-      finish(base);
-      console.warn(
-        `${MODULE_ID} | No GM available to reserve the roll counter; using a local counter. Cross-client replay will not reproduce.`
-      );
-    }, 2000);
-    try {
-      game.socket.emit(SOCKET_EVENT, { type: "reserve", id, count }, (resp) => {
-        if (resp?.type === "reserve" && resp.id === id) finish(resp.base);
-      });
-    } catch (err) {
-      // Socket unavailable entirely: fall back to the sync (GM) path.
-      finish(settingsGet(SETTINGS.rollIndex, 0));
-    }
+    const tryEmit = () => {
+      attempt++;
+      timer = setTimeout(() => {
+        if (attempt < RESERVE_RETRIES) {
+          tryEmit();
+          return;
+        }
+        // No GM answered: degrade to a local optimistic counter so rolls still vary.
+        const base = noGMCounter === null ? settingsGet(SETTINGS.rollIndex, 0) : noGMCounter;
+        noGMCounter = base + count;
+        finish(base);
+        console.warn(
+          `${MODULE_ID} | No GM available to reserve the roll counter; using a local counter. Cross-client replay will not reproduce.`
+        );
+      }, RESERVE_DELAY);
+      try {
+        game.socket.emit(SOCKET_EVENT, { type: "reserve", id, count }, (resp) => {
+          if (resp?.type === "reserve" && resp.id === id) finish(resp.base);
+        });
+      } catch (err) {
+        // Socket unavailable entirely: fall back to the sync (GM) path.
+        finish(settingsGet(SETTINGS.rollIndex, 0));
+      }
+    };
+    tryEmit();
   });
 }
 
@@ -115,6 +131,64 @@ let nativeUniform = () => Math.random();
 // State for the currently-evaluating die term. randomUniform delegates here.
 const stream = { active: false, rng: null };
 
+// Roll-scoped slot cursor. A whole Roll reserves its declared dice in ONE
+// reservation; die terms then carve offsets off this cursor instead of doing
+// their own socket handshake (a 20d20 is a single reservation, not 20).
+const rollCursor = { active: false, base: 0, used: 0, total: 0 };
+
+// Serializes whole Roll evaluations so concurrent async Rolls on one client can
+// never interleave their cursor reads/writes. Distinct from reservationTail, so a
+// Roll may await a reservation while another evaluation waits on this mutex.
+let evaluationMutex = Promise.resolve();
+function withEvaluation(fn) {
+  const run = evaluationMutex.then(fn);
+  evaluationMutex = run.catch(() => {});
+  return run;
+}
+
+// Sum of declared dice across a Roll's term tree (parentheticals and dice pools
+// included). Used only to size the single batched reservation.
+function countTermDice(roll) {
+  if (!roll || !Array.isArray(roll.terms)) return 0;
+  const DiceTerm = foundry.dice.terms.DiceTerm;
+  let total = 0;
+  for (const t of roll.terms) {
+    if (DiceTerm && t instanceof DiceTerm) total += t.number || 0;
+    else if (t?.roll && Array.isArray(t.roll.terms)) total += countTermDice(t.roll);
+    else if (Array.isArray(t?.rolls)) total += t.number || 1;
+  }
+  return total;
+}
+
+// Reserve one contiguous block for the whole Roll, then evaluate. Replacement for
+// the original Roll evaluator (evaluate/_evaluateAST/_evaluateASTAsync).
+function seedRollEvaluate(_rollEval) {
+  return async function (options) {
+    if (rollCursor.active) return _rollEval.call(this, options);
+    const opts = options ?? {};
+    if (!settingsGet(SETTINGS.enabled, true) || opts.maximize || opts.minimize) {
+      return _rollEval.call(this, opts);
+    }
+    const total = countTermDice(this);
+    if (total <= 0) return _rollEval.call(this, opts);
+    return withEvaluation(async () => {
+      const base = await reserveSlots(total);
+      rollCursor.active = true;
+      rollCursor.base = base;
+      rollCursor.used = 0;
+      rollCursor.total = total;
+      try {
+        return await _rollEval.call(this, opts);
+      } finally {
+        rollCursor.active = false;
+        rollCursor.base = 0;
+        rollCursor.used = 0;
+        rollCursor.total = 0;
+      }
+    });
+  };
+}
+
 // ---- Entropy interception ----------------------------------------------------
 // Every random draw in the dice system funnels through here. When a die term is
 // being evaluated with an active seeded stream, its values come from that stream;
@@ -124,19 +198,33 @@ function randomUniformOverride() {
   return nativeUniform();
 }
 
-// Reserve a contiguous block of rollIndex slots for a die term, seed a fresh
-// PRNG from daySeed:base, run the original roll, and release the stream.
-// Internal draws (explosions, rerolls, keep/drop) share one deterministic stream,
-// so an identical term at an identical position always reproduces the same faces.
+// Carve the term's slots out of the enclosing Roll's batched reservation (or, for
+// a standalone term outside any Roll, reserve its own block), seed a fresh PRNG
+// from daySeed:base, run the original roll, and release the stream. Internal draws
+// (explosions, rerolls, keep/drop, pool sub-dice) share one deterministic stream —
+// the active-stream guard prevents them from re-reserving or clobbering it.
 function seedTermRoll(_termRoll) {
   return async function (rollOptions) {
     const opts = rollOptions ?? {};
     if (!settingsGet(SETTINGS.enabled, true) || opts.maximize || opts.minimize) {
       return _termRoll.call(this, opts);
     }
-    const count = this.number || 1;
-    // Reserve counter slots before drawing so the seed is known up front.
-    const base = await reserveSlots(count);
+    // Nested evaluation (explosion, reroll, pool sub-die): reuse the active stream.
+    if (stream.active) return _termRoll.call(this, opts);
+    const number = this.number || 1;
+    let base;
+    if (rollCursor.active) {
+      if (rollCursor.used + number > rollCursor.total) {
+        // Estimation mismatch safety valve: never reuse a slot, supplement instead.
+        console.warn(`${MODULE_ID} | Roll had more dice than estimated; reserving supplementary slots.`);
+        base = await reserveSlots(number);
+      } else {
+        base = rollCursor.base + rollCursor.used;
+        rollCursor.used += number;
+      }
+    } else {
+      base = await reserveSlots(number);
+    }
     stream.active = true;
     stream.rng = mulberry32(hashSeed(`${settingsGet(SETTINGS.daySeed, 0)}:${base}`));
     try {
@@ -174,26 +262,60 @@ Hooks.once("init", () => {
 
   game.settings.register(MODULE_ID, SETTINGS.rollIndex, {
     name: "Roll Index",
-    hint: "Global per-die-roll counter for the current day.",
+    hint: "Global per-die-roll counter for the current day. Visible to GMs for inspection; edit only to hand-correct drift, then /roll-reset before replaying.",
     scope: "world",
-    config: false,
+    config: true,
     type: Number,
     default: 0
   });
 });
 
 Hooks.once("ready", () => {
-  // The counter authority answers reservation requests from player clients.
-  // The acknowledgment (with the reserved base slot) returns only to the requester.
-  if (game.socket && isCounterAuthority()) {
-    gmShadow = settingsGet(SETTINGS.rollIndex, 0);
+  // Always register the reservation handler, no matter what the authority was at
+  // ready time. The authority is checked per-message, so a GM that connects or is
+  // promoted later starts answering automatically (isCounterAuthority() re-evaluates
+  // live against active GMs). The acknowledgment returns only to the requester.
+  if (game.socket) {
     game.socket.on(SOCKET_EVENT, (data, ack) => {
-      if (data?.type !== "reserve") return;
+      if (data?.type !== "reserve" || !isCounterAuthority()) return;
       const base = gmAdvance(data.count);
       if (typeof ack === "function") {
         ack({ type: "reserve", id: data.id, base });
       }
     });
+  } else {
+    console.warn(
+      `${MODULE_ID} | Socket namespace unavailable. Ensure the module manifest declares "socket": true and the world was reloaded; otherwise player rolls fall back to the degraded local counter.`
+    );
+  }
+
+  // When this client becomes/assumes the counter authority (a GM logs in or out),
+  // re-sync the shadow from the persisted setting before fielding reservations.
+  Hooks.on("updateUser", (user, data) => {
+    if (typeof data.active === "undefined" || !game.user.isGM) return;
+    if (isCounterAuthority()) {
+      gmShadow = settingsGet(SETTINGS.rollIndex, 0);
+      console.log(`${MODULE_ID} | Now the roll counter authority. Counter at`, gmShadow);
+    }
+  });
+
+  console.log(
+    `${MODULE_ID} | socket=${!!game.socket} event=${SOCKET_EVENT} counterAuthority=${isCounterAuthority()}`
+  );
+
+  // Batch a Roll's declared dice into a single reservation. Roll#evaluate funnels
+  // into the AST evaluators, so wrapping those covers every dice path; the
+  // rollCursor.active guard makes nested calls (evaluate -> _evaluateAST, pool
+  // inner rolls) pass through without double-reserving.
+  const Roll = foundry.dice.Roll;
+  if (Roll?.prototype?.evaluate) {
+    Roll.prototype.evaluate = seedRollEvaluate(Roll.prototype.evaluate);
+  }
+  for (const name of ["_evaluateAST", "_evaluateASTAsync"]) {
+    const proto = Roll?.prototype ?? {};
+    if (typeof proto[name] === "function" && proto[name] !== proto.evaluate) {
+      proto[name] = seedRollEvaluate(proto[name]);
+    }
   }
 
   // Register /roll-reset as a native chat command (v14 ChatLog.CHAT_COMMANDS).
