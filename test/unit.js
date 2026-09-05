@@ -86,7 +86,9 @@ function makeSandbox({ world, isGM }) {
         },
         emit: (_ev, data, cb) => {
           world.emits.push(data);
-          if (world.reserveHandlers) {
+          if (Object.hasOwn(world, "overrideAck")) {
+            cb?.(world.overrideAck);
+          } else if (world.reserveHandlers) {
             for (const h of world.reserveHandlers) h(data, (resp) => cb?.(resp));
           } else {
             cb?.(null);
@@ -269,6 +271,32 @@ test("no-GM degraded path chains a local offset from the world counter", async (
   assert.strictEqual(first[0], ctx.nextRandom(world.defaults.daySeed, 4));
   assert.strictEqual(second[0], ctx.nextRandom(world.defaults.daySeed, 5));
   assert.strictEqual(world.stored[KEYS.rollIndex], 4, "world counter untouched when no GM");
+});
+
+test("absent reservation reply (null ack) degrades to the local chain", async () => {
+  const world = newWorld();
+  makeSandbox({ world, isGM: true }); // GM exists but never acks
+  world.stored[KEYS.rollIndex] = 4;
+  world.overrideAck = null;
+  const ctx = makeSandbox({ world, isGM: false });
+
+  const rolls = await ctx.requestRollsFromServerAsync(2);
+  const expected = [0, 1].map((i) => ctx.nextRandom(world.defaults.daySeed, 4 + i));
+  assertNumbersEqual(rolls, expected, "degraded chain starts at synced rollIndex");
+  assert.strictEqual(world.stored[KEYS.rollIndex], 4, "GM world counter untouched");
+});
+
+test("stale old-shape reply degrades to the local chain", async () => {
+  const world = newWorld();
+  makeSandbox({ world, isGM: true });
+  world.stored[KEYS.rollIndex] = 9;
+  // Old 0.0.8-style grant reply: base/count, no rolls array.
+  world.overrideAck = { id: "x", type: "reserve-respond", base: 9, count: 2 };
+  const ctx = makeSandbox({ world, isGM: false });
+
+  const rolls = await ctx.requestRollsFromServerAsync(2);
+  const expected = [0, 1].map((i) => ctx.nextRandom(world.defaults.daySeed, 9 + i));
+  assertNumbersEqual(rolls, expected, "rejects wrong shape, uses degraded chain");
 });
 
 test("end-to-end: 2d20 evaluation reproduces nextRandom-derived faces", async () => {

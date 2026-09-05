@@ -8,9 +8,10 @@ const SETTINGS = {
 	rollIndex: "rollIndex"
 };
 
-let currentSeed = 0;
-let currentOffset = 0;
+let currentSeed = null;
+let currentOffset = null;
 let gmWasActive = false; // players are local to start pre-gm
+let degradedOffset = null; // local chain position when no GM reply is available
 
 function settingsGet(key, fallback) {
 	try {
@@ -73,11 +74,11 @@ function mulberry32(seed) {
 }
 
 function nextRandom(seed, i) {
-	if(!gmWasActive || settingsGet(SETTINGS.enabled, false))
+	if(!settingsGet(SETTINGS.enabled, false))
 		return Math.random();
 	seed = seed ?? currentSeed ?? settingsGet(SETTINGS.daySeed);
 	i = i ?? currentOffset ?? settingsGet(SETTINGS.rollIndex);
-	return mulberry32(hashSeed(`${seed}:${i}`));
+	return mulberry32(hashSeed(`${seed}:${i}`))();
 }
 
 // Count all dice rolled from foundries dice objects.
@@ -122,7 +123,7 @@ function gmBroadcast() {
 	const broadcastBody = {
 		id: generateRequestId(),
 		rollIndex: settingsGet(SETTINGS.rollIndex),
-		seed,
+		seed: settingsGet(SETTINGS.daySeed),
 		type: "broadcast"
 	};
 	game.socket.broadcast.emit(SOCKET_EVENT, broadcastBody)
@@ -147,7 +148,7 @@ Hooks.once("ready", () => {
 	gmWasActive = hasActiveGM();
 
 	// Counter Authority handle count and broadcast result.
-	game.socket.on(SOCKET_EVENT, data => {
+	game.socket.on(SOCKET_EVENT, (data, response) => {
 		if (!data || data?.type !== "reserve" || !isCounterAuthority())
 			return;
 		const requestedCount = Math.floor(Number(data.count ?? 0)) || 1;
@@ -158,7 +159,8 @@ Hooks.once("ready", () => {
 			type: "reserve-respond",
 			rolls: Array.from({length: requestedCount}).map((_, i) => nextRandom(seed, prevCount + i))
 		};
-		respond(responseBody);
+		if (typeof response === "function")
+			response(responseBody);
 		gmAdvance(requestedCount);
 		gmBroadcast();
 	});
@@ -168,14 +170,28 @@ Hooks.once("ready", () => {
 			return;
 		currentOffset = data.rollIndex;
 		currentSeed = data.seed;
+		degradedOffset = null;
 	});
 });
 
+// Degraded path: no GM online, or the GM's reply was missing or stale. Chain a
+// deterministic block locally, advancing from the last synced world counter so the
+// day's sequence stays continuous without touching world state.
+function chainLocalRolls(count) {
+	if (degradedOffset === null)
+		degradedOffset = settingsGet(SETTINGS.rollIndex, 0);
+	return Array.from({ length: count }, () => nextRandom(undefined, degradedOffset++));
+}
+
 function requestRollsFromServerAsync(count) {
-	if(isCounterAuthority())
+	if(isCounterAuthority()) {
+		const base = settingsGet(SETTINGS.rollIndex, 0);
+		const rolls = Array.from({ length: count }, (_, i) => nextRandom(undefined, base + i));
 		gmAdvance(count);
-	if(!hasActiveGM() || isCounterAuthority())
-		return Promise.resolve(Array.from({length: count}).map((_, i) => nextRandom(undefined, i + count)));
+		return Promise.resolve(rolls);
+	}
+	if(!hasActiveGM())
+		return Promise.resolve(chainLocalRolls(count));
 	return new Promise(finish => {
 		var reserveRequestBody = {
 			type: "reserve",
@@ -184,8 +200,11 @@ function requestRollsFromServerAsync(count) {
 			count
 		};
 		game.socket.emit(SOCKET_EVENT, reserveRequestBody, (resp) => {
-			console.log(resp);
-			finish(grant.rolls);
+			if (resp && Array.isArray(resp.rolls)) {
+				finish(resp.rolls);
+			} else {
+				finish(chainLocalRolls(count));
+			}
 		});
 	});
 }
@@ -210,6 +229,32 @@ Hooks.once("ready", () => {
 
 
 
+// Roll-scoped cursor: the chunk of uniform values this Roll reserved in one batch.
+// Die terms slice their uniforms off this cursor instead of doing their own round trip.
+const rollCursor = { active: false, rolls: [], used: 0, total: 0 };
+
+// Stream currently feeding the interleaved RNG consumer during a die term's own
+// evaluation. randomUniformOverride pops values off it one die at a time.
+const stream = { active: false, rolls: [], idx: 0 };
+
+// Serialize whole Roll evaluations so concurrent async Rolls on one client never
+// interleave their cursor reads/writes.
+let evaluationMutex = Promise.resolve();
+function withEvaluation(fn) {
+	const run = evaluationMutex.then(fn);
+	evaluationMutex = run.catch(() => {});
+	return run;
+}
+
+// Every random draw in the dice system funnels through here (via
+// CONFIG.Dice.randomUniform); a die term under an active stream consumes its
+// pre-computed uniforms, otherwise native randomness is used.
+function randomUniformOverride() {
+	if (stream.active && stream.idx < stream.rolls.length)
+		return stream.rolls[stream.idx++];
+	return Math.random();
+}
+
 // Reserve one contiguous block for the whole Roll, then evaluate. Replacement for
 // the original Roll evaluator (evaluate/_evaluateAST/_evaluateASTAsync).
 function seedRollEvaluate(protoRollEvaluate) {
@@ -223,16 +268,16 @@ function seedRollEvaluate(protoRollEvaluate) {
 		if (total <= 0)
 			return protoRollEvaluate.call(this, opts);
 		return withEvaluation(async () => {
-			const base = await requestRollsFromServerAsync(total);
+			const rolls = await requestRollsFromServerAsync(total);
 			rollCursor.active = true;
-			rollCursor.base = base;
+			rollCursor.rolls = rolls;
 			rollCursor.used = 0;
 			rollCursor.total = total;
 			try {
 				return await protoRollEvaluate.call(this, opts);
 			} finally {
 				rollCursor.active = false;
-				rollCursor.base = 0;
+				rollCursor.rolls = [];
 				rollCursor.used = 0;
 				rollCursor.total = 0;
 			}
@@ -240,11 +285,11 @@ function seedRollEvaluate(protoRollEvaluate) {
 	};
 }
 
-// Carve the term's slots out of the enclosing Roll's batched reservation (or, for
-// a standalone term outside any Roll, reserve its own block), seed a fresh PRNG
-// from daySeed:base, run the original roll, and release the stream. Internal draws
-// (explosions, rerolls, keep/drop, pool sub-dice) share one deterministic stream —
-// the active-stream guard prevents them from re-reserving or clobbering it.
+// Carve the term's uniforms out of the enclosing Roll's batched reservation (or, for
+// a standalone term outside any Roll, fetch its own block), make them the active
+// stream, run the original roll, and release the stream. Internal draws (explosions,
+// rerolls, keep/drop, pool sub-dice) share one stream — the active-stream guard
+// prevents them from re-reserving or clobbering it.
 function seedTermRoll(prototype) {
 	return async function (rollOptions) {
 		const opts = rollOptions ?? {};
@@ -256,26 +301,28 @@ function seedTermRoll(prototype) {
 			return prototype.call(this, opts);
 
 		const number = this.number || 1;
-		let base;
+		let rolls;
 		if (rollCursor.active) {
 			if (rollCursor.used + number > rollCursor.total) {
 				// Estimation mismatch safety valve: never reuse a slot, supplement instead.
 				console.warn(`${MODULE_ID} | Roll had more dice than estimated; reserving supplementary slots.`);
-				base = await reserveSlots(number);
+				rolls = await requestRollsFromServerAsync(number);
 			} else {
-				base = rollCursor.base + rollCursor.used;
+				rolls = rollCursor.rolls.slice(rollCursor.used, rollCursor.used + number);
 				rollCursor.used += number;
 			}
 		} else {
-			base = await reserveSlots(number);
+			rolls = await requestRollsFromServerAsync(number);
 		}
 		stream.active = true;
-		stream.rng = mulberry32(hashSeed(`${settingsGet(SETTINGS.daySeed, 0)}:${base}`));
+		stream.rolls = rolls;
+		stream.idx = 0;
 		try {
 			return await prototype.call(this, opts);
 		} finally {
 			stream.active = false;
-			stream.rng = null;
+			stream.rolls = [];
+			stream.idx = 0;
 		}
 	};
 }
