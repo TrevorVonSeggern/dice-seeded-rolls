@@ -233,7 +233,7 @@ function requestRollsFromServerAsync(count) {
 	});
 }
 
-// Register /roll-reset
+// Register /roll-reset and /roll-index
 Hooks.once("ready", () => {
 	const ChatLog = foundry.applications.sidebar.tabs.ChatLog;
 	if (ChatLog?.CHAT_COMMANDS && !ChatLog.CHAT_COMMANDS["roll-reset"]) {
@@ -241,10 +241,28 @@ Hooks.once("ready", () => {
 			rgx: /^\/roll-reset(?:\s|$)/,
 			fn: async function () {
 				if (!isCounterAuthority())
-					return;
+					return false;
 				settingsSet(SETTINGS.rollIndex, 0);
 				console.log(`${MODULE_ID} | Roll counter reset to 0. Seed unchanged:`, settingsGet(SETTINGS.daySeed));
 				gmBroadcast();
+				return false; // Return false to consume the command so nothing is posted to chat.
+			}
+		};
+	}
+	if (ChatLog?.CHAT_COMMANDS && !ChatLog.CHAT_COMMANDS["roll-index"]) {
+		ChatLog.CHAT_COMMANDS["roll-index"] = {
+			rgx: /^\/roll-index(?:\s+(\d+))?(?:\s|$)/,
+			fn: async function (_chatLog, _message, match) {
+				if (!isCounterAuthority())
+					return false;
+				const desired = match?.[1] !== undefined ? Math.floor(Number(match[1])) : null;
+				if (desired !== null) {
+					settingsSet(SETTINGS.rollIndex, desired);
+					console.log(`${MODULE_ID} | Roll counter set to ${desired}. Next roll uses offset ${desired}.`);
+					gmBroadcast();
+				} else {
+					console.log(`${MODULE_ID} | Roll index is ${settingsGet(SETTINGS.rollIndex)}. Day seed is ${settingsGet(SETTINGS.daySeed)}.`);
+				}
 				return false; // Return false to consume the command so nothing is posted to chat.
 			}
 		};

@@ -58,6 +58,11 @@ reload the world (an stale module build with no socket namespace makes every res
   returned number as the Day Seed and `/roll-reset` the counter.
 - **Start / reset a day**: type `/roll-reset` in chat (GM only). This **only** zeroes the roll
   counter; the day seed is left untouched. The command line is consumed and not posted to chat.
+- **Inspect the counter**: type `/roll-index` in chat (GM only) to print the current roll index and
+  day seed to the console.
+- **Set the counter**: type `/roll-index <n>` in chat (GM only) to jump the roll
+  index to an exact value. Handy for hand-correcting drift or resuming a partially consumed day;
+  the change is broadcast to all clients. Like `/roll-reset`, the command line is consumed.
 - **Toggle detection**: toggle `Enabled`. When disabled, rolls fall back to Foundry's native
   randomness **without advancing the counter**. Re-enabling resumes at the last counter value,
   so always `/roll-reset` to establish a clean baseline before a replay.
@@ -87,7 +92,7 @@ Plain JavaScript, no build step. Layout mirrors the reference module:
 
 ```
 module.json                  # manifest: id, compatibility, esmodules, languages
-scripts/module.js            # settings, seeded PRNG, randomUniform override, die-term counter, /roll-reset
+scripts/module.js            # settings, seeded PRNG, randomUniform override, die-term counter, /roll-reset, /roll-index
 lang/en.json                 # localization
 .github/workflows/release.yml
 ```

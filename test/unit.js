@@ -310,6 +310,67 @@ test("absent reservation reply degrades to the local chain after the timeout", a
   assert.strictEqual(world.stored[KEYS.rollIndex], 4, "GM world counter untouched");
 });
 
+test("roll-index command reads the current index and seed", async () => {
+  const world = newWorld();
+  const ctx = makeSandbox({ world, isGM: true });
+  world.stored[KEYS.rollIndex] = 7;
+  world.stored[KEYS.daySeed] = 7704;
+  const cmd = ctx.foundry.applications.sidebar.tabs.ChatLog.CHAT_COMMANDS["roll-index"];
+
+  const match = "/roll-index".match(cmd.rgx);
+  const result = await cmd.fn(null, "/roll-index", match);
+  assert.strictEqual(result, false, "command consumes the message");
+  assert.strictEqual(world.stored[KEYS.rollIndex], 7, "read does not change the index");
+});
+
+test("roll-index command sets the index as the authority and broadcasts", async () => {
+  const world = newWorld();
+  const ctx = makeSandbox({ world, isGM: true });
+  world.stored[KEYS.rollIndex] = 3;
+  const cmd = ctx.foundry.applications.sidebar.tabs.ChatLog.CHAT_COMMANDS["roll-index"];
+
+  const match = "/roll-index 9".match(cmd.rgx);
+  await cmd.fn(null, "/roll-index 9", match);
+  assert.strictEqual(world.stored[KEYS.rollIndex], 9, "world counter set to 9");
+  assert.ok(
+    world.emits.some((e) => e?.type === "broadcast" && e.rollIndex === 9),
+    "counter change broadcast to clients"
+  );
+});
+
+test("roll-index command refuses both read and set as a non-authority", async () => {
+  const world = newWorld();
+  makeSandbox({ world, isGM: true }); // real GM owns the counter
+  const ctx = makeSandbox({ world, isGM: false });
+  world.stored[KEYS.rollIndex] = 3;
+  const cmd = ctx.foundry.applications.sidebar.tabs.ChatLog.CHAT_COMMANDS["roll-index"];
+
+  const reads = "/roll-index".match(cmd.rgx);
+  const readResult = await cmd.fn(null, "/roll-index", reads);
+  assert.strictEqual(readResult, false, "read is consumed for non-authority");
+  assert.strictEqual(world.stored[KEYS.rollIndex], 3, "player cannot change the world counter");
+
+  const sets = "/roll-index 9".match(cmd.rgx);
+  await cmd.fn(null, "/roll-index 9", sets);
+  assert.strictEqual(world.stored[KEYS.rollIndex], 3, "player cannot set the world counter");
+  assert.ok(
+    !world.emits.some((e) => e?.type === "broadcast"),
+    "player actions never broadcast a counter change"
+  );
+});
+
+test("roll-reset command requires the counter authority", async () => {
+  const world = newWorld();
+  makeSandbox({ world, isGM: true }); // real GM owns the counter
+  const ctx = makeSandbox({ world, isGM: false });
+  world.stored[KEYS.rollIndex] = 5;
+  const cmd = ctx.foundry.applications.sidebar.tabs.ChatLog.CHAT_COMMANDS["roll-reset"];
+
+  const result = await cmd.fn(null, "/roll-reset", "/roll-reset".match(cmd.rgx));
+  assert.strictEqual(result, false, "reset is consumed even when refused");
+  assert.strictEqual(world.stored[KEYS.rollIndex], 5, "player cannot reset the world counter");
+});
+
 test("stale old-shape reply degrades to the local chain", async () => {
   const world = newWorld();
   makeSandbox({ world, isGM: true });
