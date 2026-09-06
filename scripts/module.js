@@ -252,7 +252,9 @@ Hooks.once("ready", () => {
 	if (ChatLog?.CHAT_COMMANDS && !ChatLog.CHAT_COMMANDS["roll-index"]) {
 		ChatLog.CHAT_COMMANDS["roll-index"] = {
 			rgx: /^\/roll-index(?:\s+(\d+))?(?:\s|$)/,
-			fn: async function (_chatLog, _message, match) {
+			// v14 invokes chat-command handlers as `fn.call(log, command, match, chatData, createOptions)`.
+			// `match` is the RegExpMatchArray from `message.match(rgx)`, so match[1] is the captured offset.
+			fn: async function (command, match) {
 				if (!isCounterAuthority())
 					return false;
 				const desired = match?.[1] !== undefined ? Math.floor(Number(match[1])) : null;

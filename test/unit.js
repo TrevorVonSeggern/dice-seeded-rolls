@@ -317,8 +317,9 @@ test("roll-index command reads the current index and seed", async () => {
   world.stored[KEYS.daySeed] = 7704;
   const cmd = ctx.foundry.applications.sidebar.tabs.ChatLog.CHAT_COMMANDS["roll-index"];
 
-  const match = "/roll-index".match(cmd.rgx);
-  const result = await cmd.fn(null, "/roll-index", match);
+  // v14 dispatches commands as fn.call(log, command, match, chatData, createOptions),
+  // where match is the RegExpMatchArray (not the chat data object).
+  const result = await cmd.fn.call({}, "roll-index", "/roll-index".match(cmd.rgx), {}, {});
   assert.strictEqual(result, false, "command consumes the message");
   assert.strictEqual(world.stored[KEYS.rollIndex], 7, "read does not change the index");
 });
@@ -329,8 +330,7 @@ test("roll-index command sets the index as the authority and broadcasts", async 
   world.stored[KEYS.rollIndex] = 3;
   const cmd = ctx.foundry.applications.sidebar.tabs.ChatLog.CHAT_COMMANDS["roll-index"];
 
-  const match = "/roll-index 9".match(cmd.rgx);
-  await cmd.fn(null, "/roll-index 9", match);
+  await cmd.fn.call({}, "roll-index", "/roll-index 9".match(cmd.rgx), {}, {});
   assert.strictEqual(world.stored[KEYS.rollIndex], 9, "world counter set to 9");
   assert.ok(
     world.emits.some((e) => e?.type === "broadcast" && e.rollIndex === 9),
@@ -345,13 +345,11 @@ test("roll-index command refuses both read and set as a non-authority", async ()
   world.stored[KEYS.rollIndex] = 3;
   const cmd = ctx.foundry.applications.sidebar.tabs.ChatLog.CHAT_COMMANDS["roll-index"];
 
-  const reads = "/roll-index".match(cmd.rgx);
-  const readResult = await cmd.fn(null, "/roll-index", reads);
+  const readResult = await cmd.fn.call({}, "roll-index", "/roll-index".match(cmd.rgx), {}, {});
   assert.strictEqual(readResult, false, "read is consumed for non-authority");
   assert.strictEqual(world.stored[KEYS.rollIndex], 3, "player cannot change the world counter");
 
-  const sets = "/roll-index 9".match(cmd.rgx);
-  await cmd.fn(null, "/roll-index 9", sets);
+  await cmd.fn.call({}, "roll-index", "/roll-index 9".match(cmd.rgx), {}, {});
   assert.strictEqual(world.stored[KEYS.rollIndex], 3, "player cannot set the world counter");
   assert.ok(
     !world.emits.some((e) => e?.type === "broadcast"),
@@ -366,7 +364,7 @@ test("roll-reset command requires the counter authority", async () => {
   world.stored[KEYS.rollIndex] = 5;
   const cmd = ctx.foundry.applications.sidebar.tabs.ChatLog.CHAT_COMMANDS["roll-reset"];
 
-  const result = await cmd.fn(null, "/roll-reset", "/roll-reset".match(cmd.rgx));
+  const result = await cmd.fn.call({}, "roll-reset", "/roll-reset".match(cmd.rgx), {}, {});
   assert.strictEqual(result, false, "reset is consumed even when refused");
   assert.strictEqual(world.stored[KEYS.rollIndex], 5, "player cannot reset the world counter");
 });
