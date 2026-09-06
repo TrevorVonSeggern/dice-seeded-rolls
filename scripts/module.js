@@ -252,19 +252,20 @@ Hooks.once("ready", () => {
 	if (ChatLog?.CHAT_COMMANDS && !ChatLog.CHAT_COMMANDS["roll-index"]) {
 		ChatLog.CHAT_COMMANDS["roll-index"] = {
 			rgx: /^\/roll-index(?:\s+(\d+))?(?:\s|$)/,
-			// v14 invokes chat-command handlers as `fn.call(log, command, match, chatData, createOptions)`.
-			// `match` is the RegExpMatchArray from `message.match(rgx)`, so match[1] is the captured offset.
-			fn: async function (command, match) {
+			fn: async function (_command, match) {
 				if (!isCounterAuthority())
 					return false;
 				const desired = match?.[1] !== undefined ? Math.floor(Number(match[1])) : null;
 				if (desired !== null) {
 					settingsSet(SETTINGS.rollIndex, desired);
-					console.log(`${MODULE_ID} | Roll counter set to ${desired}. Next roll uses offset ${desired}.`);
 					gmBroadcast();
-				} else {
-					console.log(`${MODULE_ID} | Roll index is ${settingsGet(SETTINGS.rollIndex)}. Day seed is ${settingsGet(SETTINGS.daySeed)}.`);
 				}
+				ChatMessage.create({
+					user: game.user.id,
+					speaker: ChatMessage.getSpeaker(),
+					content: `${MODULE_ID} | Roll counter set to ${settingsGet(SETTINGS.rollIndex)}. Day seed is ${settingsGet(SETTINGS.daySeed)}.`,
+					whisper: [game.user.id]
+				})?.then(() => {});
 				return false; // Return false to consume the command so nothing is posted to chat.
 			}
 		};
